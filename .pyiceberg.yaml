@@ -1,0 +1,5 @@
+catalog:
+  local:
+    type: sql
+    uri: sqlite:////home/bobo/Desktop/iceberg_demos/iceberg_catalog/catalog.db
+    warehouse: file:///home/bobo/Desktop/iceberg_demos/iceberg_catalog

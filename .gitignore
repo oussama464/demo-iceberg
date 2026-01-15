@@ -1,0 +1,23 @@
+.ruff
+.venv
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+.env
+.env.*
+coverage/
+htmlcov/
+.tox/
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.cache/
+.pyright/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/ 
+# Virtual environment
