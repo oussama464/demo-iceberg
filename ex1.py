@@ -1,3 +1,17 @@
+child_tables = [
+        # (table_name, dag_id_col, task_id_col, run_id_col)
+        ("xcom", "dag_id", "task_id", "dag_run_id"),
+        ("rendered_task_instance_fields", "dag_id", "task_id", "run_id"),
+        ("task_reschedule", "dag_id", "task_id", "run_id"),
+        ("task_fail", "dag_id", "task_id", "run_id"),
+        ("task_instance_note", "dag_id", "task_id", "run_id"),
+        ("task_instance_history", "dag_id", "task_id", "run_id"),
+        ("sla_miss", "dag_id", "task_id", None), # No run_id link
+        ("log", "dag_id", "task_id", None),      # No run_id link
+    ]
+
+
+
 logger.info("Step 2: Updating child tables (skipping duplicates)...")
         for table_info in active_children:
             # Unpack the new 4-item tuple
