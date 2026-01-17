@@ -1,53 +1,108 @@
-# --- STEP 2: SWITCH CHILDREN ---
-        child_tables = get_child_tables(inspector)
-        logger.info(f"Step 2: Switching pointers in {len(child_tables)} child tables...")
+import logging
+import sys
+from sqlalchemy import create_engine, text, inspect
+from sqlalchemy.orm import sessionmaker
+
+# --- CONFIGURATION ---
+DB_CONN = "postgresql+psycopg2://airflow:airflow@localhost/airflow"
+DAG_ID = "taskgroup_rename_history_demo"
+OLD_GROUP_NAME = "fxpm"
+NEW_GROUP_NAME = "bonds"
+# ---------------------
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("airflow_db_patch")
+
+def get_ti_columns(inspector):
+    """Get all columns for task_instance to allow row cloning."""
+    return [c['name'] for c in inspector.get_columns('task_instance')]
+
+def run_migration():
+    if OLD_GROUP_NAME == NEW_GROUP_NAME:
+        logger.error("Old and New Group Names are the same.")
+        return
+
+    try:
+        engine = create_engine(DB_CONN)
+        Session = sessionmaker(bind=engine)
+        session = Session()
+        inspector = inspect(engine)
+    except Exception as e:
+        logger.error(f"Failed to connect to database: {e}")
+        sys.exit(1)
+
+    params = {
+        "dag_id": DAG_ID,
+        "new_prefix": f"{NEW_GROUP_NAME}.",
+        "len_old": len(f"{OLD_GROUP_NAME}.") + 1,
+        "like_pattern": f"{OLD_GROUP_NAME}.%",
+    }
+
+    # Tables referencing task_instance
+    child_tables = [
+        ("xcom", "dag_id", "task_id"),
+        ("rendered_task_instance_fields", "dag_id", "task_id"),
+        ("task_reschedule", "dag_id", "task_id"),
+        ("task_fail", "dag_id", "task_id"),
+        ("task_instance_note", "dag_id", "task_id"),
+        ("task_instance_history", "dag_id", "task_id"),
+        ("sla_miss", "dag_id", "task_id"),
+        ("log", "dag_id", "task_id"),
+        ("dataset_event", "source_dag_id", "source_task_id"),
+    ]
+
+    existing_tables = set(inspector.get_table_names())
+    active_children = [t for t in child_tables if t[0] in existing_tables]
+
+    try:
+        logger.info("Step 1: Cloning task_instance rows to satisfy FKs...")
+        ti_cols = get_ti_columns(inspector)
         
-        for table in child_tables:
-            # Handle dataset_event special column naming
-            t_col = 'source_task_id' if table == 'dataset_event' else 'task_id'
-            d_col = 'source_dag_id' if table == 'dataset_event' else 'dag_id'
+        # Build column list for INSERT, replacing task_id with the new name
+        col_names = ", ".join(ti_cols)
+        select_clause = ", ".join([
+            f":new_prefix || SUBSTRING(task_id FROM :len_old)" if c == 'task_id' else c 
+            for c in ti_cols
+        ])
 
-            # --- DYNAMIC COLLISION CHECK ---
-            # We must inspect the table to see which columns define "uniqueness" (PK)
-            # so we can build a "NOT EXISTS" clause.
-            tbl_cols = [c['name'] for c in inspector.get_columns(table)]
-            
-            # Build conditions to match the row (DAG + Run + other keys)
-            match_criteria = [f"t2.{d_col} = {table}.{d_col}"] 
+        # We use ON CONFLICT DO NOTHING in case Step 1 was partially run before
+        clone_sql = text(f"""
+            INSERT INTO task_instance ({col_names})
+            SELECT {select_clause} FROM task_instance
+            WHERE dag_id = :dag_id AND task_id LIKE :like_pattern
+            ON CONFLICT DO NOTHING
+        """)
+        
+        clone_res = session.execute(clone_sql, params)
+        logger.info(f"   -> Cloned {clone_res.rowcount} rows in task_instance.")
 
-            # Add relevant columns if they exist in this table
-            if 'run_id' in tbl_cols:
-                match_criteria.append(f"t2.run_id = {table}.run_id")
-            if 'map_index' in tbl_cols:
-                match_criteria.append(f"t2.map_index = {table}.map_index")
-            if 'key' in tbl_cols:      # Critical for XComs
-                match_criteria.append(f"t2.key = {table}.key")
-            if 'try_number' in tbl_cols: # Helpful for task_fail / task_reschedule
-                match_criteria.append(f"t2.try_number = {table}.try_number")
-
-            match_sql = " AND ".join(match_criteria)
-
-            # This clause prevents the UPDATE if the target row already exists
-            not_exists_clause = f"""
-                AND NOT EXISTS (
-                    SELECT 1 FROM {table} t2
-                    WHERE t2.{t_col} = :new_prefix || SUBSTRING({table}.{t_col} FROM :len_old)
-                    AND {match_sql}
-                )
-            """
-
-            update_query = text(f"""
+        logger.info("Step 2: Updating child tables (preserving history)...")
+        for table, dag_col, task_col in active_children:
+            update_sql = text(f"""
                 UPDATE {table}
-                SET {t_col} = :new_prefix || SUBSTRING({t_col} FROM :len_old)
-                WHERE {d_col} = :dag_id AND {t_col} LIKE :like_pattern
-                {not_exists_clause}
+                SET {task_col} = :new_prefix || SUBSTRING({task_col} FROM :len_old)
+                WHERE {dag_col} = :dag_id AND {task_col} LIKE :like_pattern
             """)
-            
-            res = session.execute(update_query, {
-                'dag_id': DAG_ID, 'new_prefix': new_prefix,
-                'len_old': len_old, 'like_pattern': like_pattern
-            })
-            if res.rowcount > 0:
-                logger.info(f"   -> Updated {res.rowcount} rows in '{table}'")
-            else:
-                logger.info(f"   -> No eligible rows updated in '{table}' (orphans or collisions skipped)")
+            upd_res = session.execute(update_sql, params)
+            logger.info(f"   -> Updated {upd_res.rowcount} rows in {table}.")
+
+        logger.info("Step 3: Cleaning up old task_instance rows...")
+        cleanup_sql = text("""
+            DELETE FROM task_instance
+            WHERE dag_id = :dag_id AND task_id LIKE :like_pattern
+        """)
+        del_res = session.execute(cleanup_sql, params)
+        logger.info(f"   -> Deleted {del_res.rowcount} old task_instance rows.")
+
+        session.commit()
+        logger.info("SUCCESS: Migration complete.")
+
+    except Exception as e:
+        session.rollback()
+        logger.error(f"CRITICAL ERROR: {e}")
+        raise
+    finally:
+        session.close()
+
+if __name__ == "__main__":
+    run_migration()
